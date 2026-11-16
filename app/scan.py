@@ -12,10 +12,15 @@
 * 只有整份原件解析通过后，订阅者才会把暂存原子改名为结果文件并置
   completed；任一行格式错误或扫描异常，本代所有未完任务 failed，
   不提供部分结果。
-* 取消只影响本任务；最后一个活跃任务取消时，扫描线程在下一个检查点真正
-  停止并清空本代暂存目录后，任务才以 cancelled 落库。
+* 取消与发布的交接：两者在同一把锁内裁决，先到先得——取消先受理则
+  绝不发布（任务走向 cancelled）；成功先提交则保留成功，取消返回
+  “不可取消”的说明。状态不会出现 cancelling 之后又 completed。
+* 任务报 cancelled 之前，本任务已停止写入且暂存已清除；最后一个活跃
+  任务取消时，接口还会等本代扫描真正停止、本代暂存目录清空。发布或
+  清理缓慢时取消不无限等待：超时先返回 cancelling 处理状态，查询与
+  重复取消如实反映进度。
 * 收尾期间允许受理新任务：管理器为其建立新一代扫描，旧扫描的清理只动
-  旧代目录，互不干扰。
+  旧代目录，旧代的取消与清理不影响新代。
 """
 from __future__ import annotations
 
@@ -38,6 +43,13 @@ POLL_INTERVAL = 0.05
 SPOOL_FLUSH_BYTES = 256 * 1024
 SPOOL_FLUSH_ROWS = 32
 
+# 取消未生效（任务已处终态）时随响应返回的说明
+TERMINAL_CANCEL_NOTES = {
+    "completed": "任务已成功完成，结果保留，不可取消",
+    "failed": "任务已失败，不可取消",
+    "interrupted": "任务已中断，不可取消",
+}
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -58,6 +70,9 @@ class TaskState:
     result_path: str | None = None
     created_at: str = field(default_factory=_now)
     finished: threading.Event = field(default_factory=threading.Event)
+    # 挂载的订阅者（create_task 接线时设置），取消时直接定位，
+    # 不经“当前代”查找，避免新旧代交替时找错控制器
+    subscriber: "Subscriber | None" = field(default=None, repr=False)
 
     def public(self) -> dict:
         return {
@@ -76,7 +91,14 @@ class TaskState:
 
 
 class Subscriber:
-    """订阅一次扫描的单个任务：负责补读 spool、在线筛行与结果落盘。"""
+    """订阅一次扫描的单个任务：负责补读 spool、在线筛行与结果落盘。
+
+    取消/发布/收尾的交接约定：
+    * request_cancel 与 _publish 在同一把 _io_lock 内裁决，先到先得；
+    * 非成功终态统一在 _finalize 中“先清暂存、再落库”，保证对外可见
+      cancelled/failed/interrupted 时本任务暂存已经清除；
+    * _terminal 一经裁定不再翻转，重复取消/并发异常都幂等。
+    """
 
     def __init__(self, state: TaskState, controller: "ScanController", db: Database):
         self.state = state
@@ -85,41 +107,82 @@ class Subscriber:
         self.thread = threading.Thread(
             target=self._run, name=f"sub-{state.task_id[:8]}", daemon=True
         )
-        self._io_lock = threading.Lock()  # 保护暂存文件的写/改名/删除
+        self._io_lock = threading.Lock()  # 取消/发布裁决 + 暂存文件的写/改名
         self._staging = controller.dir / f"{state.task_id}.staging.csv"
         self._file = None
         self.catching_up = True
         self.cancel_requested = False
         self.retired = False
+        self._terminal: str | None = None  # 已裁定的终态（落库在 _finalize/_publish）
+        self._terminal_error: str | None = None
 
     # -- 生命周期 ----------------------------------------------------------
     def start(self) -> None:
         self.thread.start()
 
-    def request_cancel(self) -> None:
-        self.cancel_requested = True
-        self.state.status = "cancelling"
-        self.db.update_task(self.state.task_id, status="cancelling", now=_now())
+    def request_cancel(self) -> bool:
+        """受理取消；与发布在同一把锁内裁决，先到先得。
 
-    def retire(self) -> None:
-        """线程退出时的一次性收尾：关文件并按最终状态处理暂存。"""
-        if self.retired:
-            return
-        self.retired = True
+        返回 True 表示取消生效（任务将走向 cancelled，绝不发布）；
+        返回 False 表示终态已裁定/提交（例如已成功发布），取消不再生效。
+        """
         with self._io_lock:
+            if self._terminal is not None or self.state.finished.is_set():
+                return False
+            self.cancel_requested = True
+            self.state.status = "cancelling"
+            self.db.update_task(self.state.task_id, status="cancelling", now=_now())
+            return True
+
+    def _decide(self, status: str, error: str | None = None) -> bool:
+        """裁定终态（先到先得）；暂存清理与落库在 _finalize 中完成。"""
+        with self._io_lock:
+            if self._terminal is not None:
+                return False
+            self._terminal = status
+            self._terminal_error = error
+            return True
+
+    def _finalize(self) -> None:
+        """线程退出前的一次性收尾：关文件、非成功终态先清暂存再落库。
+
+        “先清暂存、再提交终态”保证：接口或查询报出 cancelled/failed 时，
+        本任务的暂存文件一定已经清除。清理暂存不占用裁决锁，清理缓慢
+        也不会阻塞取消受理。
+        """
+        with self._io_lock:
+            if self.retired:
+                return
+            self.retired = True
             if self._file is not None:
                 try:
                     self._file.close()
                 except Exception:
                     pass
                 self._file = None
-            if self.state.status == "completed":
-                return  # 已原子改名，无暂存可清
+            terminal = self._terminal
+            if terminal is None:
+                terminal = self._terminal = "failed"
+                self._terminal_error = self._terminal_error or "任务异常退出"
+        if terminal == "completed":
+            return  # 已在 _publish 中改名并落库，无暂存可清
+        # 先清除本任务暂存
+        try:
             if self._staging.exists():
-                try:
-                    self._staging.unlink()
-                except OSError:
-                    pass
+                self._staging.unlink()
+        except OSError:
+            pass
+        # 再对外提交终态
+        with self._io_lock:
+            self.state.status = terminal
+            self.state.error = self._terminal_error
+            self.db.update_task(
+                self.state.task_id,
+                status=terminal,
+                error=self._terminal_error,
+                now=_now(),
+            )
+            self.state.finished.set()
 
     # -- 主循环 ------------------------------------------------------------
     def _run(self) -> None:
@@ -128,32 +191,33 @@ class Subscriber:
             self._open_staging()
             # 1) 补读加入之前已经扫过的部分（来自 spool，不碰原件）
             self._catch_up()
-            # 2) 等待在线投递，直到扫描进入终态
+            # 2) 等待在线投递，直到扫描进入终态或本任务被裁定终态
             with ctl.cond:
                 while ctl.state == "running":
-                    if self.cancel_requested:
+                    if self.cancel_requested or self._terminal is not None:
                         break
                     ctl.cond.wait(timeout=POLL_INTERVAL)
 
-            # 3) 终态归一化
-            if self.cancel_requested and ctl.state == "running":
-                self._finish_cancelled()
-            elif ctl.state == "aborted":
-                # 用户主动取消仍记 cancelled；进程关闭导致的中止记 interrupted
-                if not self.cancel_requested and ctl.manager.shutting_down:
-                    self._finish_interrupted("服务关闭，任务中断")
-                else:
-                    self._finish_cancelled()
-            elif ctl.state == "error":
-                self._finish_failed(ctl.error or "扫描失败")
-            elif ctl.state == "complete":
-                self._finish_complete()
-            else:  # 理论上不可达，保守按失败处理
-                self._finish_failed(f"扫描处于未知状态 {ctl.state}")
+            # 3) 终态裁定（已被裁定的跳过，例如扫描线程发现的行内异常）
+            if self._terminal is None:
+                if self.cancel_requested and ctl.state == "running":
+                    self._decide("cancelled")
+                elif ctl.state == "aborted":
+                    # 用户主动取消仍记 cancelled；进程关闭导致的中止记 interrupted
+                    if not self.cancel_requested and ctl.manager.shutting_down:
+                        self._decide("interrupted", "服务关闭，任务中断")
+                    else:
+                        self._decide("cancelled")
+                elif ctl.state == "error":
+                    self._decide("failed", ctl.error or "扫描失败")
+                elif ctl.state == "complete":
+                    self._publish()
+                else:  # 理论上不可达，保守按失败处理
+                    self._decide("failed", f"扫描处于未知状态 {ctl.state}")
         except Exception as exc:  # 订阅者自身 IO 异常也算任务失败
-            self._finish_failed(f"任务处理异常: {exc!r}")
+            self._decide("failed", f"任务处理异常: {exc!r}")
         finally:
-            self.retire()
+            self._finalize()
             with ctl.cond:
                 ctl.subscribers.discard(self)
                 if not ctl.subscribers:
@@ -215,59 +279,41 @@ class Subscriber:
                     self.state.matched_rows += 1
 
     # -- 终态处理 ----------------------------------------------------------
-    def _finish_complete(self) -> None:
-        if self.state.finished.is_set():
-            return
-        if self.cancel_requested:
-            self._finish_cancelled()
-            return
-        result = config.RESULTS_DIR / f"{self.state.task_id}.csv"
+    def _publish(self) -> None:
+        """整份原件校验通过后的发布提交：与取消在同一把锁内裁决。
+
+        取消先受理则改判 cancelled（绝不发布）；否则改名+落库一次性提交，
+        提交之后到达的取消只能看到 completed 与“不可取消”的说明。
+        """
         with self._io_lock:
-            if self._file is not None:
-                self._file.flush()
-                self._file.close()
-                self._file = None
-            self._staging.replace(result)  # 同目录原子改名
-        self.state.status = "completed"
-        self.state.result_path = str(result)
-        self.db.update_task(
-            self.state.task_id,
-            status="completed",
-            result_path=str(result),
-            matched_rows=self.state.matched_rows,
-            now=_now(),
-        )
-        self.state.finished.set()
-
-    def _finish_failed(self, error: str) -> None:
-        if self.state.finished.is_set():
-            return
-        self.state.status = "failed"
-        self.state.error = error
-        self.db.update_task(
-            self.state.task_id, status="failed", error=error, now=_now()
-        )
-        self.state.finished.set()
-
-    def _finish_cancelled(self) -> None:
-        if self.state.finished.is_set():
-            return
-        self.state.status = "cancelled"
-        self.state.error = None
-        self.db.update_task(
-            self.state.task_id, status="cancelled", error=None, now=_now()
-        )
-        self.state.finished.set()
-
-    def _finish_interrupted(self, error: str) -> None:
-        if self.state.finished.is_set():
-            return
-        self.state.status = "interrupted"
-        self.state.error = error
-        self.db.update_task(
-            self.state.task_id, status="interrupted", error=error, now=_now()
-        )
-        self.state.finished.set()
+            if self._terminal is not None:
+                return
+            if self.cancel_requested:
+                # 取消先受理：不得发布
+                self._terminal = "cancelled"
+                return
+            result = config.RESULTS_DIR / f"{self.state.task_id}.csv"
+            try:
+                if self._file is not None:
+                    self._file.flush()
+                    self._file.close()
+                    self._file = None
+                self._staging.replace(result)  # 同一数据卷内原子改名
+            except OSError as exc:
+                self._terminal = "failed"
+                self._terminal_error = f"结果发布失败: {exc!r}"
+                return
+            self._terminal = "completed"
+            self.state.status = "completed"
+            self.state.result_path = str(result)
+            self.db.update_task(
+                self.state.task_id,
+                status="completed",
+                result_path=str(result),
+                matched_rows=self.state.matched_rows,
+                now=_now(),
+            )
+            self.state.finished.set()
 
 
 class ScanController:
@@ -310,7 +356,7 @@ class ScanController:
         self.thread.start()
 
     def request_stop(self) -> None:
-        """最后一个订阅者离开时调用，请求扫描线程尽快停止。"""
+        """最后一个活跃订阅者离开时调用，请求扫描线程尽快停止。"""
         with self.cond:
             self._stop_requested = True
             self.cond.notify_all()
@@ -340,7 +386,7 @@ class ScanController:
             for raw_line in src:
                 line_no += 1
                 self.scanned_rows = line_no - 1
-                # 取消检查点：最后一个订阅者离开后尽快停下
+                # 取消检查点：最后一个活跃订阅者离开后尽快停下
                 with self.cond:
                     while self._has_catching_up_subscriber():
                         self.cond.wait(timeout=POLL_INTERVAL)
@@ -375,14 +421,14 @@ class ScanController:
                 self.cond.wait(timeout=min(POLL_INTERVAL, deadline - time.monotonic()))
 
     def _dispatch(self, line: str) -> None:
-        """把一行在线投递给已完成补读的订阅者。"""
+        """把一行在线投递给已完成补读、且仍在途的订阅者。"""
         for sub in list(self.subscribers):
-            if sub.catching_up or sub.cancel_requested:
+            if sub.catching_up or sub.cancel_requested or sub._terminal is not None:
                 continue
             try:
                 sub._handle_line(line)
             except Exception as exc:  # 单个任务异常不拖垮整代扫描
-                sub._finish_failed(f"任务处理异常: {exc!r}")
+                sub._decide("failed", f"任务处理异常: {exc!r}")
 
     def _buffer_for_spool(self, raw_line: str, spool) -> None:
         # spool 以二进制追加，统一编码为 UTF-8，保留原件原始换行符
@@ -493,23 +539,24 @@ class ScanManager:
             temp_max,
             state.created_at,
         )
-        self.tasks[task_id] = state
 
         with self._lock:
             ctl = self._controllers.get(source_id)
             # 旧扫描在终态/停止收尾中也不影响：开新一代，目录彼此隔离。
-            # 检查与挂载在控制器同一把条件锁内完成，杜绝挂到即将停止的旧代。
             if ctl is None or ctl.state != "running":
                 ctl = self._new_controller(source_id, int(source["row_delay_ms"]))
-            sub = Subscriber(state, ctl, self.db)
+            # 检查与挂载在控制器同一把条件锁内完成，杜绝挂到即将停止的旧代。
             with ctl.cond:
                 if ctl.state != "running" or ctl._stop_requested:
                     ctl = self._new_controller(source_id, int(source["row_delay_ms"]))
-                    sub = Subscriber(state, ctl, self.db)
+                sub = Subscriber(state, ctl, self.db)
+                state.subscriber = sub
                 ctl.subscribers.add(sub)
                 ctl.cond.notify_all()
             state.status = "running"
             self.db.update_task(task_id, status="running", now=_now())
+            # 接线完成后再对外可见，取消一定能找到订阅者
+            self.tasks[task_id] = state
             sub.start()
         return state
 
@@ -523,53 +570,64 @@ class ScanManager:
         return ctl
 
     # -- 取消 --------------------------------------------------------------
-    def cancel_task(self, task_id: str, wait_timeout: float = 30.0) -> TaskState:
+    def cancel_task(
+        self, task_id: str, wait_timeout: float | None = None
+    ) -> tuple[TaskState, str | None]:
+        """受理取消并按交接约定等待收尾，返回 (任务状态, 附加说明)。
+
+        * 取消先受理（发布尚未提交）：任务走向 cancelled，绝不发布；
+        * 成功先提交：保留成功，返回“不可取消”的说明；
+        * 本任务报 cancelled 前，其写入已停止、暂存已清除；
+        * 最后一个活跃任务取消时，还要等本代扫描停止、本代暂存清空；
+        * 发布/清理缓慢时等待以 CANCEL_WAIT_TIMEOUT_S 为限，超时先返回
+          cancelling 处理状态，查询与重复取消如实反映进度。
+        """
         state = self.tasks.get(task_id)
         if state is None:
             raise KeyError(task_id)
-        if state.finished.is_set():
-            return state
+        if wait_timeout is None:
+            wait_timeout = config.CANCEL_WAIT_TIMEOUT_S
 
-        ctl = self._controllers.get(state.source_id)
-        sub = self._find_subscriber(ctl, task_id)
+        sub = state.subscriber
+        accepted = False
         is_last = False
-        if sub is not None:
-            sub.request_cancel()
-            with ctl.cond:
-                # 活跃 = 仍在订阅集合中、且未请求取消的订阅者
-                # （已进入终态的订阅者会在 finally 中自行从集合移除）
-                active = [
-                    s for s in ctl.subscribers if not s.cancel_requested
-                ]
-                is_last = len(active) == 0
-            if is_last:
-                ctl.request_stop()
+        ctl: ScanController | None = None
+        if sub is not None and not state.finished.is_set():
+            ctl = sub.controller
+            accepted = sub.request_cancel()
+            if accepted:
+                with ctl.cond:
+                    # 活跃 = 未请求取消、也未裁定终态的订阅者
+                    is_last = not any(
+                        not s.cancel_requested and not s.state.finished.is_set()
+                        for s in ctl.subscribers
+                    )
+                if is_last:
+                    ctl.request_stop()
 
-        # 任务终态先落定
+        # 等本任务终态落定（含暂存清理）；清理缓慢则及时返回处理中状态
         if not state.finished.wait(timeout=wait_timeout):
-            return state
-        # 最后一个任务：必须等扫描实际停止、暂存清除后才报 cancelled
-        if is_last and ctl is not None and ctl.state != "complete":
+            return state, None
+        # 最后一个任务：还须等本代扫描停止、暂存清空
+        if accepted and is_last and ctl is not None:
             ctl.terminated.wait(timeout=wait_timeout)
-        return state
-
-    def _find_subscriber(
-        self, ctl: ScanController | None, task_id: str
-    ) -> Subscriber | None:
-        if ctl is None:
-            return None
-        with ctl.cond:
-            for sub in ctl.subscribers:
-                if sub.state.task_id == task_id:
-                    return sub
-        return None
+        note = None
+        if not accepted:
+            note = TERMINAL_CANCEL_NOTES.get(state.status)
+        return state, note
 
     # -- 控制器回调 ---------------------------------------------------------
     def _on_subscriber_left(self, ctl: ScanController) -> None:
         with ctl.cond:
-            if not ctl.subscribers and ctl.state == "running":
-                # 兜底：正常路径由 cancel_task 触发，这里防止漏网
-                ctl.request_stop()
+            if ctl.state != "running":
+                return
+            # 没有活跃订阅者时兜底停止（正常路径由 cancel_task 触发）
+            if any(
+                not s.cancel_requested and not s.state.finished.is_set()
+                for s in ctl.subscribers
+            ):
+                return
+            ctl.request_stop()
 
     def _on_controller_terminated(self, ctl: ScanController) -> None:
         with self._lock:

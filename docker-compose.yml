@@ -11,6 +11,8 @@ services:
       # 可控慢扫描默认关闭；演示时改为例如 20（每行 20ms）
       SCAN_ROW_DELAY_MS: "0"
       SCAN_DELAY_EVERY_ROWS: "1"
+      # 取消接口等待任务终态/本代收尾的最长秒数，超时先返回 cancelling
+      CANCEL_WAIT_TIMEOUT_S: "2.0"
     volumes:
       - subset-data:/data
     mem_limit: 128m

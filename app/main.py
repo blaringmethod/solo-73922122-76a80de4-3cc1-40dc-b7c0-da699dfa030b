@@ -19,7 +19,7 @@ from pydantic import BaseModel, Field
 from . import config
 from .csvutil import HEADER, CsvFormatError, validate_header
 from .db import Database
-from .scan import ScanManager, _now
+from .scan import TERMINAL_CANCEL_NOTES, ScanManager, _now
 
 
 def _row_to_dict(row) -> dict:
@@ -215,15 +215,31 @@ def get_task(task_id: str):
 
 @app.post("/tasks/{task_id}/cancel")
 def cancel_task(task_id: str):
+    """取消任务。
+
+    取消先受理（发布尚未提交）则任务走向 cancelled 且绝不发布；
+    成功先提交则保留成功并说明不可取消。本任务报 cancelled 时其暂存
+    已清除；最后一个任务取消时还会等本代扫描停止、暂存清空。清理缓慢
+    时先返回 cancelling，查询与重复取消如实反映进度。
+    """
     manager = _manager(app)
     if task_id not in manager.tasks:
         # 重启前遗留的任务已在启动时标 interrupted
         row = app.state.db.get_task(task_id)
         if row is None:
             raise HTTPException(status_code=404, detail="task 不存在")
-        return _row_to_dict(row)
-    state = manager.cancel_task(task_id)
-    return state.public()
+        data = _row_to_dict(row)
+        note = TERMINAL_CANCEL_NOTES.get(row["status"])
+        if note:
+            data["message"] = note
+        return data
+    state, note = manager.cancel_task(task_id)
+    data = state.public()
+    if note:
+        data["message"] = note
+    elif data["status"] == "cancelling":
+        data["message"] = "取消已受理，正在停止写入并清理暂存"
+    return data
 
 
 @app.get("/tasks/{task_id}/result")

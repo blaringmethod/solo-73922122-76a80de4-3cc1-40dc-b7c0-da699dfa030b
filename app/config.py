@@ -12,6 +12,13 @@ def _int_env(name: str, default: int) -> int:
         return default
 
 
+def _float_env(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
+
+
 # 数据根目录（容器内为 /data，本地默认项目下 data/）
 DATA_DIR = Path(os.environ.get("DATA_DIR", str(Path(__file__).resolve().parent.parent / "data")))
 
@@ -21,6 +28,10 @@ MAX_UPLOAD_BYTES = _int_env("MAX_UPLOAD_BYTES", 256 * 1024 * 1024)
 # 可控慢扫描：每读多少行 sleep 一次、每次 sleep 多少毫秒（演示/测试用，0 表示关闭）
 SCAN_DELAY_EVERY_ROWS = max(1, _int_env("SCAN_DELAY_EVERY_ROWS", 1))
 SCAN_ROW_DELAY_MS = _int_env("SCAN_ROW_DELAY_MS", 0)
+
+# 取消接口等待“本任务终态落定 / 本代扫描收尾”的最长秒数；
+# 发布或清理缓慢时超时先返回 cancelling 处理状态，不无限阻塞
+CANCEL_WAIT_TIMEOUT_S = _float_env("CANCEL_WAIT_TIMEOUT_S", 2.0)
 
 SOURCES_DIR = DATA_DIR / "sources"
 RESULTS_DIR = DATA_DIR / "results"
